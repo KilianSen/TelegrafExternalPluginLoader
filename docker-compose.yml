@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  plugin-loader:
+    image: ghcr.io/kiliansen/telegraf-plugin-loader:latest
+    environment:
+      - PLUGIN_SOURCES=https://github.com/influxdata/telegraf.git  # Example: replace with actual plugin sources
+    volumes:
+      - plugins:/plugins
+    command: ["./plugin-loader"]
+
+  telegraf:
+    image: telegraf:latest
+    depends_on:
+      - plugin-loader
+    volumes:
+      - plugins:/plugins
+      - ./telegraf.conf:/etc/telegraf/telegraf.conf:ro
+    ports:
+      - "8125:8125/udp"
+      - "8092:8092"
+      - "8094:8094"
+
+volumes:
+  plugins:
