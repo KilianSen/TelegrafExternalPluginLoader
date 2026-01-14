@@ -24,12 +24,11 @@ jobs:
         id: semantic
         uses: cycjimmy/semantic-release-action@v6
         with:
-          semantic_version: 18.0.0
           dry_run: false
           extra_plugins: |
-             '@semantic-release/commit-analyzer' 
-             '@semantic-release/release-notes-generator'
-             '@semantic-release/github'
+             @semantic-release/commit-analyzer
+             @semantic-release/release-notes-generator
+             @semantic-release/github
         env:
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
 
