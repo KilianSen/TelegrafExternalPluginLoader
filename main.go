@@ -117,6 +117,16 @@ func handleRepo(repoURL string, pluginsDir string) error {
 		return fmt.Errorf("git clone failed: %s", string(output))
 	}
 
+	// Tidy modules if go.mod exists
+	if _, err := os.Stat(filepath.Join(tempDir, "go.mod")); err == nil {
+		fmt.Printf("  [%s] Running go mod tidy...\n", repoURL)
+		tidyCmd := exec.Command("go", "mod", "tidy")
+		tidyCmd.Dir = tempDir
+		if output, err := tidyCmd.CombinedOutput(); err != nil {
+			fmt.Printf("  [%s] Warning: go mod tidy failed: %s\n", repoURL, string(output))
+		}
+	}
+
 	// Determine build method
 	if _, err := os.Stat(filepath.Join(tempDir, "Makefile")); err == nil {
 		fmt.Printf("  [%s] Running make...\n", repoURL)
@@ -141,21 +151,28 @@ func handleRepo(repoURL string, pluginsDir string) error {
 	repoName := strings.TrimSuffix(filepath.Base(repoURL), ".git")
 	var binPath string
 
-	// Prefer exact match or "plugin_binary" if we just built it
-	if p := filepath.Join(tempDir, repoName); isExecutable(p) {
-		binPath = p
-	} else if p := filepath.Join(tempDir, "plugin_binary"); isExecutable(p) {
+	// 1. Check for "plugin_binary" (our fallback build output)
+	if p := filepath.Join(tempDir, "plugin_binary"); isExecutable(p) {
 		binPath = p
 	} else {
+		// 2. Walk to find the best candidate
 		_ = filepath.Walk(tempDir, func(path string, info os.FileInfo, err error) error {
-			if binPath != "" || err != nil || info.IsDir() {
+			if err != nil || info.IsDir() {
 				return nil
 			}
 			if strings.Contains(path, ".git") {
 				return filepath.SkipDir
 			}
 			if isLikelyBinary(path, info, repoName) {
-				binPath = path
+				// If we find an exact match for repo name, use it and stop walking
+				if strings.EqualFold(info.Name(), repoName) {
+					binPath = path
+					return filepath.SkipDir
+				}
+				// Otherwise, keep the first likely candidate but continue looking for a better one
+				if binPath == "" {
+					binPath = path
+				}
 			}
 			return nil
 		})
@@ -183,11 +200,18 @@ func isLikelyBinary(path string, info os.FileInfo, repoName string) bool {
 	ignoredExts := map[string]bool{
 		".go": true, ".md": true, ".txt": true, ".yml": true,
 		".yaml": true, ".sh": true, ".sum": true, ".mod": true,
-		".c": true, ".h": true, ".cpp": true,
+		".c": true, ".h": true, ".cpp": true, ".py": true,
+		".json": true, ".xml": true,
 	}
 	if ignoredExts[ext] {
 		return false
 	}
+	// Avoid common build artifacts that aren't the main binary
+	name := strings.ToLower(info.Name())
+	if name == "makefile" || name == "license" || name == "dockerfile" {
+		return false
+	}
+
 	return true
 }
 
