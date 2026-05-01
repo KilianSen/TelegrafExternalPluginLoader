@@ -1,7 +1,7 @@
 FROM golang:1.25-alpine
 
 # Install dependencies required for fetching and building
-RUN apk add --no-cache git make
+RUN apk add --no-cache git make gcc musl-dev
 
 WORKDIR /app
 

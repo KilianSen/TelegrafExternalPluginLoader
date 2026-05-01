@@ -4,16 +4,18 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 const (
-	// Output directory for plugins (mapped to volume in Docker)
-	pluginsDir = "/plugins"
-	envSources = "PLUGIN_SOURCES"
+	defaultPluginsDir = "/plugins"
+	envSources        = "PLUGIN_SOURCES"
+	envPluginsDir     = "PLUGIN_DIR"
 )
 
 func main() {
@@ -23,99 +25,128 @@ func main() {
 		return
 	}
 
+	pluginsDir := getPluginsDir()
+
 	// Ensure output directory exists
 	if err := os.MkdirAll(pluginsDir, 0755); err != nil {
-		fmt.Printf("Error creating plugins directory: %v\n", err)
+		fmt.Printf("Error creating plugins directory %s: %v\n", pluginsDir, err)
 		os.Exit(1)
 	}
 
 	sources := strings.Split(sourcesEnv, ",")
+	var wg sync.WaitGroup
+
 	for _, source := range sources {
 		source = strings.TrimSpace(source)
 		if source == "" {
 			continue
 		}
 
-		fmt.Printf("Processing source: %s\n", source)
-		if err := processSource(source); err != nil {
-			fmt.Printf("Error processing %s: %v\n", source, err)
-		} else {
-			fmt.Printf("Successfully installed %s\n", source)
-		}
+		wg.Add(1)
+		go func(s string) {
+			defer wg.Done()
+			fmt.Printf("Processing source: %s\n", s)
+			if err := processSource(s, pluginsDir); err != nil {
+				fmt.Printf("Error processing %s: %v\n", s, err)
+			} else {
+				fmt.Printf("Successfully installed %s\n", s)
+			}
+		}(source)
 	}
+
+	wg.Wait()
 }
 
-func processSource(source string) error {
+func getPluginsDir() string {
+	if pd := os.Getenv(envPluginsDir); pd != "" {
+		return pd
+	}
+	return defaultPluginsDir
+}
+
+func processSource(source string, pluginsDir string) error {
 	// Heuristic: If it ends in .git, treat as repo. Otherwise, treat as direct file download.
-	if strings.HasSuffix(source, ".git") {
-		return handleRepo(source)
+	if strings.HasSuffix(strings.ToLower(source), ".git") {
+		return handleRepo(source, pluginsDir)
 	}
-	return handleFile(source)
+	return handleFile(source, pluginsDir)
 }
 
-func handleFile(url string) error {
-	resp, err := http.Get(url)
+func getFileNameFromURL(rawURL string) (string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	name := filepath.Base(parsed.Path)
+	if name == "." || name == "/" {
+		return "", fmt.Errorf("could not determine filename from URL path: %s", parsed.Path)
+	}
+	return name, nil
+}
+
+func handleFile(sourceURL string, pluginsDir string) error {
+	resp, err := http.Get(sourceURL)
 	if err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			fmt.Printf("Error closing response body: %v\n", err)
-		}
-	}(resp.Body)
+	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("bad status: %s", resp.Status)
 	}
 
-	fileName := filepath.Base(url)
+	fileName, err := getFileNameFromURL(sourceURL)
+	if err != nil {
+		return err
+	}
 	destPath := filepath.Join(pluginsDir, fileName)
 
 	return writeExecutable(destPath, resp.Body)
 }
 
-func handleRepo(repoURL string) error {
-	// Create temp dir for cloning
+func handleRepo(repoURL string, pluginsDir string) error {
 	tempDir, err := os.MkdirTemp("", "telegraf-plugin-build-*")
 	if err != nil {
 		return fmt.Errorf("failed to create temp dir: %w", err)
 	}
-	defer func(path string) {
-		err := os.RemoveAll(path)
-		if err != nil {
-			fmt.Printf("Error removing temp dir %s: %v\n", path, err)
-		}
-	}(tempDir)
+	defer os.RemoveAll(tempDir)
 
-	// 1. Git Clone
-	fmt.Println("  - Cloning repository...")
+	fmt.Printf("  [%s] Cloning repository...\n", repoURL)
 	cmd := exec.Command("git", "clone", "--depth", "1", repoURL, tempDir)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git clone failed: %s", string(output))
 	}
 
-	// 2. Run Make
-	fmt.Println("  - Running make...")
-	cmd = exec.Command("make")
-	cmd.Dir = tempDir
-	// Redirect stdout/stderr to see build logs in docker logs
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("make failed: %w", err)
+	// Determine build method
+	if _, err := os.Stat(filepath.Join(tempDir, "Makefile")); err == nil {
+		fmt.Printf("  [%s] Running make...\n", repoURL)
+		buildCmd := exec.Command("make")
+		buildCmd.Dir = tempDir
+		buildCmd.Stdout = os.Stdout
+		buildCmd.Stderr = os.Stderr
+		if err := buildCmd.Run(); err != nil {
+			return fmt.Errorf("make failed: %w", err)
+		}
+	} else {
+		fmt.Printf("  [%s] No Makefile found, trying go build...\n", repoURL)
+		buildCmd := exec.Command("go", "build", "-o", "plugin_binary", ".")
+		buildCmd.Dir = tempDir
+		buildCmd.Stdout = os.Stdout
+		buildCmd.Stderr = os.Stderr
+		if err := buildCmd.Run(); err != nil {
+			return fmt.Errorf("go build failed: %w", err)
+		}
 	}
 
-	// 3. Find Executable
-	// Strategy: Look for a file named after the repo, or scan for new executable files.
 	repoName := strings.TrimSuffix(filepath.Base(repoURL), ".git")
-
 	var binPath string
-	// Check for exact match first
-	if isExecutable(filepath.Join(tempDir, repoName)) {
-		binPath = filepath.Join(tempDir, repoName)
+
+	// Prefer exact match or "plugin_binary" if we just built it
+	if p := filepath.Join(tempDir, repoName); isExecutable(p) {
+		binPath = p
+	} else if p := filepath.Join(tempDir, "plugin_binary"); isExecutable(p) {
+		binPath = p
 	} else {
-		// Walk to find a likely binary (executable, not a directory, no extension)
 		_ = filepath.Walk(tempDir, func(path string, info os.FileInfo, err error) error {
 			if binPath != "" || err != nil || info.IsDir() {
 				return nil
@@ -123,9 +154,7 @@ func handleRepo(repoURL string) error {
 			if strings.Contains(path, ".git") {
 				return filepath.SkipDir
 			}
-
-			// Check executable bit and ensure no extension (avoids .sh, .go, etc)
-			if info.Mode()&0111 != 0 && !strings.Contains(info.Name(), ".") {
+			if isLikelyBinary(path, info, repoName) {
 				binPath = path
 			}
 			return nil
@@ -136,20 +165,30 @@ func handleRepo(repoURL string) error {
 		return fmt.Errorf("no executable binary found after build")
 	}
 
-	// 4. Move to plugins folder
 	destPath := filepath.Join(pluginsDir, filepath.Base(binPath))
 	f, err := os.Open(binPath)
 	if err != nil {
 		return err
 	}
-	defer func(f *os.File) {
-		err := f.Close()
-		if err != nil {
-			fmt.Printf("Error closing file %s: %v\n", binPath, err)
-		}
-	}(f)
+	defer f.Close()
 
 	return writeExecutable(destPath, f)
+}
+
+func isLikelyBinary(path string, info os.FileInfo, repoName string) bool {
+	if info.Mode()&0111 == 0 {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(path))
+	ignoredExts := map[string]bool{
+		".go": true, ".md": true, ".txt": true, ".yml": true,
+		".yaml": true, ".sh": true, ".sum": true, ".mod": true,
+		".c": true, ".h": true, ".cpp": true,
+	}
+	if ignoredExts[ext] {
+		return false
+	}
+	return true
 }
 
 func isExecutable(path string) bool {
@@ -157,19 +196,19 @@ func isExecutable(path string) bool {
 	return err == nil && !info.IsDir() && info.Mode()&0111 != 0
 }
 
-func writeExecutable(path string, r io.Reader) error {
+func writeExecutable(path string, r io.Reader) (err error) {
 	out, err := os.Create(path)
 	if err != nil {
 		return err
 	}
-	defer func(out *os.File) {
-		err := out.Close()
-		if err != nil {
-			fmt.Printf("Error closing file %s: %v\n", path, err)
+	defer func() {
+		closeErr := out.Close()
+		if err == nil {
+			err = closeErr
 		}
-	}(out)
+	}()
 
-	if _, err := io.Copy(out, r); err != nil {
+	if _, err = io.Copy(out, r); err != nil {
 		return err
 	}
 	return os.Chmod(path, 0755)
